@@ -5,17 +5,120 @@ from typing import Optional, List
 from pypdf import PdfReader, PdfWriter
 import tempfile
 import os
+import calendar
+from functools import lru_cache
 
 app = FastAPI(title="Timesheet Filler API")
 
-# Day-to-suffix mapping for field names
-DAY_SUFFIXES = {
+# Default day-to-suffix mapping (fallback if template parsing fails)
+DEFAULT_DAY_SUFFIXES = {
     1: "TUE", 2: "WED", 3: "THU", 4: "FRI", 5: "SAT", 6: "SUN", 7: "MON",
     8: "TUE_2", 9: "WED_2", 10: "THU_2", 11: "FRI_2", 12: "SAT_2", 13: "SUN_2", 14: "MON_2",
     15: "TUE_3", 16: "WED_3", 17: "THU_3", 18: "FRI_3", 19: "SAT_3", 20: "SUN_3", 21: "MON_3",
     22: "TUE_4", 23: "WED_4", 24: "THU_4", 25: "FRI_4", 26: "SAT_4", 27: "SUN_4", 28: "MON_4",
     29: "TUE_5", 30: "WED_5", 31: "THU_5"
 }
+
+MONTH_ABBR_TO_INDEX = {
+    "JAN": 0, "FEB": 1, "MAR": 2, "APR": 3, "MAY": 4, "JUN": 5,
+    "JUL": 6, "AUG": 7, "SEP": 8, "OCT": 9, "NOV": 10, "DEC": 11
+}
+
+
+def parse_month_year(month_str: Optional[str]) -> Optional[tuple]:
+    if not month_str:
+        return None
+    parts = month_str.strip().upper().split()
+    if len(parts) != 2:
+        return None
+    mon_abbr, year_str = parts
+    if mon_abbr not in MONTH_ABBR_TO_INDEX:
+        return None
+    try:
+        year = int(year_str)
+    except ValueError:
+        return None
+    return (year, MONTH_ABBR_TO_INDEX[mon_abbr])
+
+
+WEEKDAY_ABBR_TITLE = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+WEEKDAY_ABBR_UPPER = {0: "MON", 1: "TUE", 2: "WED", 3: "THU", 4: "FRI", 5: "SAT", 6: "SUN"}
+
+
+@lru_cache(maxsize=32)
+def build_day_suffixes_from_template(template_path: str) -> dict:
+    """
+    Build a day->suffix mapping by reading the template's existing Day dropdown values.
+
+    The PDF time fields are named like:
+      TIME ON 1THU, TIME ON 1THU_2, ...
+    The template's Day 01..Day 31 dropdown values tell us which weekday that row
+    was originally aligned to, which we can convert into the suffix names.
+    """
+    reader = PdfReader(template_path)
+    fields = reader.get_fields() or {}
+
+    weekday_counts = {abbr: 0 for abbr in WEEKDAY_ABBR_UPPER.values()}
+    mapping: dict[int, str] = {}
+
+    for day in range(1, 32):
+        day_key = f"Day {str(day).zfill(2)}"
+        field = fields.get(day_key)
+        raw_val = None
+        if field:
+            raw_val = field.get("/V") or field.get("/DV")
+
+        val = str(raw_val).strip() if raw_val is not None else ""
+        if val == "...":
+            mapping[day] = DEFAULT_DAY_SUFFIXES.get(day, "TUE")
+            continue
+
+        abbr = val[:3].upper()
+        if abbr not in weekday_counts:
+            mapping[day] = DEFAULT_DAY_SUFFIXES.get(day, "TUE")
+            continue
+
+        weekday_counts[abbr] += 1
+        mapping[day] = abbr if weekday_counts[abbr] == 1 else f"{abbr}_{weekday_counts[abbr]}"
+
+    # Ensure we have a mapping for all possible days
+    for day in range(1, 32):
+        mapping.setdefault(day, DEFAULT_DAY_SUFFIXES.get(day, "TUE"))
+
+    return mapping
+
+
+def fill_day_dropdowns(field_values: dict, month_str: Optional[str]) -> None:
+    """
+    Fill Day 01..Day 31 dropdowns with the correct weekday for the requested month/year.
+    Allowed values in the template are: Mon/Tue/Wed/Thu/Fri/Sat/Sun and '...'.
+    """
+    parsed = parse_month_year(month_str)
+    if not parsed:
+        return
+
+    year, month_index = parsed
+    _, days_in_month = calendar.monthrange(year, month_index + 1)
+
+    for day in range(1, 32):
+        key = f"Day {str(day).zfill(2)}"
+        if day > days_in_month:
+            field_values[key] = "..."
+            continue
+        weekday = calendar.weekday(year, month_index + 1, day)  # 0=Mon..6=Sun
+        field_values[key] = WEEKDAY_ABBR_TITLE[weekday]
+
+
+def resolve_template_path(month_str: Optional[str]) -> str:
+    """Select a template based on month string if available."""
+    parsed = parse_month_year(month_str)
+    if parsed:
+        year, month_index = parsed
+        month_abbr = list(MONTH_ABBR_TO_INDEX.keys())[month_index]
+        candidate = f"Leader_Timesheets_{month_abbr}_{year}.pdf"
+        if os.path.exists(candidate):
+            return candidate
+    return os.environ.get("TEMPLATE_PATH", "Leader_Timesheets_JAN_2026.pdf")
 
 
 class Shift(BaseModel):
@@ -59,9 +162,9 @@ class TimesheetData(BaseModel):
     hours_used_total: Optional[str] = None
 
 
-def get_field_names_for_day(day: int) -> dict:
+def get_field_names_for_day(day: int, day_suffixes: dict) -> dict:
     """Get all field names for a specific day."""
-    suffix = DAY_SUFFIXES.get(day)
+    suffix = day_suffixes.get(day)
     if not suffix:
         raise ValueError(f"Invalid day: {day}")
     
@@ -88,7 +191,7 @@ def get_field_names_for_day(day: int) -> dict:
 @app.post("/fill-timesheet")
 async def fill_timesheet(data: TimesheetData):
     """Fill the timesheet PDF with provided data and return the filled PDF."""
-    template_path = os.environ.get("TEMPLATE_PATH", "Leader_Timesheets_JAN_2026.pdf")
+    template_path = resolve_template_path(data.month)
     
     if not os.path.exists(template_path):
         raise HTTPException(status_code=500, detail=f"Template PDF not found at {template_path}")
@@ -99,6 +202,12 @@ async def fill_timesheet(data: TimesheetData):
         writer.append(reader)
         
         field_values = {}
+
+        # Always set weekday dropdowns based on requested month (prevents manual edits)
+        fill_day_dropdowns(field_values, data.month)
+
+        # Determine which suffix corresponds to each date row in THIS template file
+        day_suffixes = build_day_suffixes_from_template(template_path)
         
         # Header fields
         field_values["employee-name"] = data.employee_name
@@ -119,7 +228,7 @@ async def fill_timesheet(data: TimesheetData):
         
         # Process each shift
         for shift in data.shifts:
-            fields = get_field_names_for_day(shift.day)
+            fields = get_field_names_for_day(shift.day, day_suffixes)
             
             if shift.time_on_1:
                 field_values[fields["time_on_1"]] = shift.time_on_1
@@ -200,6 +309,6 @@ async def list_fields():
             "BASIC-TOTAL", "NIGHT-DUTY-TOTAL", "SUN-TOTAL",
             "PUB-HOL-TOTAL", "DIS-TOTAL", "UNDIS-TOTAL", "HOURS-USED-TOTAL"
         ],
-        "day_suffixes": DAY_SUFFIXES,
-        "example_day_1_fields": get_field_names_for_day(1)
+        "day_suffixes": DEFAULT_DAY_SUFFIXES,
+        "example_day_1_fields": get_field_names_for_day(1, DEFAULT_DAY_SUFFIXES)
     }
