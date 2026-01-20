@@ -45,6 +45,43 @@ WEEKDAY_ABBR_TITLE = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat"
 WEEKDAY_ABBR_UPPER = {0: "MON", 1: "TUE", 2: "WED", 3: "THU", 4: "FRI", 5: "SAT", 6: "SUN"}
 
 
+def build_day_suffixes_from_month(month_str: Optional[str]) -> dict:
+    """
+    Build day->suffix mapping based on the actual month/year requested.
+    This ensures that day 1 maps to the correct weekday suffix for that specific month.
+
+    For example, if March 2026 starts on Sunday:
+    - Day 1 (Sun) -> "SUN"
+    - Day 2 (Mon) -> "MON"
+    - Day 3 (Tue) -> "TUE"
+    - Day 8 (Sun) -> "SUN_2"
+    etc.
+    """
+    parsed = parse_month_year(month_str)
+    if not parsed:
+        # If we can't parse the month, return a generic mapping
+        # This should rarely happen in practice
+        return DEFAULT_DAY_SUFFIXES
+
+    year, month_index = parsed
+    _, days_in_month = calendar.monthrange(year, month_index + 1)
+
+    weekday_counts = {abbr: 0 for abbr in WEEKDAY_ABBR_UPPER.values()}
+    mapping: dict[int, str] = {}
+
+    for day in range(1, days_in_month + 1):
+        weekday = calendar.weekday(year, month_index + 1, day)  # 0=Mon..6=Sun
+        abbr = WEEKDAY_ABBR_UPPER[weekday]
+        weekday_counts[abbr] += 1
+
+        if weekday_counts[abbr] == 1:
+            mapping[day] = abbr
+        else:
+            mapping[day] = f"{abbr}_{weekday_counts[abbr]}"
+
+    return mapping
+
+
 @lru_cache(maxsize=32)
 def build_day_suffixes_from_template(template_path: str) -> dict:
     """
@@ -206,8 +243,9 @@ async def fill_timesheet(data: TimesheetData):
         # Always set weekday dropdowns based on requested month (prevents manual edits)
         fill_day_dropdowns(field_values, data.month)
 
-        # Determine which suffix corresponds to each date row in THIS template file
-        day_suffixes = build_day_suffixes_from_template(template_path)
+        # Build day-to-suffix mapping based on the requested month/year
+        # This ensures day 1 data goes to the correct row regardless of template
+        day_suffixes = build_day_suffixes_from_month(data.month)
         
         # Header fields
         field_values["employee-name"] = data.employee_name
@@ -299,7 +337,13 @@ async def root():
 
 
 @app.get("/fields")
-async def list_fields():
+async def list_fields(month: str = "MAR 2026"):
+    """
+    List all field types and show example field names for a given month.
+    Query parameter: month (default: "MAR 2026")
+    Example: /fields?month=JAN%202026
+    """
+    day_suffixes = build_day_suffixes_from_month(month)
     return {
         "header_fields": [
             "employee-name", "employee-number", "employee-payroll",
@@ -309,6 +353,8 @@ async def list_fields():
             "BASIC-TOTAL", "NIGHT-DUTY-TOTAL", "SUN-TOTAL",
             "PUB-HOL-TOTAL", "DIS-TOTAL", "UNDIS-TOTAL", "HOURS-USED-TOTAL"
         ],
-        "day_suffixes": DEFAULT_DAY_SUFFIXES,
-        "example_day_1_fields": get_field_names_for_day(1, DEFAULT_DAY_SUFFIXES)
+        "month": month,
+        "day_suffixes": day_suffixes,
+        "example_day_1_fields": get_field_names_for_day(1, day_suffixes),
+        "example_day_7_fields": get_field_names_for_day(7, day_suffixes)
     }
