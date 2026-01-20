@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any
 from pypdf import PdfReader, PdfWriter
 import tempfile
 import os
 import calendar
 from functools import lru_cache
+from payroll_parser import parse_payroll_shifts
 
 app = FastAPI(title="Timesheet Filler API")
 
@@ -185,10 +186,10 @@ class TimesheetData(BaseModel):
     month: Optional[str] = "JAN 2026"
     sheets: Optional[str] = None
     comments: Optional[str] = None
-    
+
     # Shifts data
     shifts: List[Shift]
-    
+
     # Optional totals
     basic_total: Optional[str] = None
     night_duty_total: Optional[str] = None
@@ -197,6 +198,33 @@ class TimesheetData(BaseModel):
     disturbed_total: Optional[str] = None
     undisturbed_total: Optional[str] = None
     hours_used_total: Optional[str] = None
+
+
+class PayrollShiftEntry(BaseModel):
+    date: int
+    day: str
+    time: str
+    on_shift: str
+    comments: str
+
+
+class PayrollTimesheetEntry(BaseModel):
+    employee: str
+    start_date: int
+    start_day: str
+    start_time: str
+    end_date: int
+    end_day: str
+    end_time: str
+    total_hours: int
+    comments: str
+
+
+class PayrollData(BaseModel):
+    shifts: List[PayrollShiftEntry]
+    timesheets: List[PayrollTimesheetEntry]
+    summary: str
+    totalEntries: int
 
 
 def get_field_names_for_day(day: int, day_suffixes: dict) -> dict:
@@ -324,6 +352,157 @@ async def fill_timesheet(data: TimesheetData):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fill-timesheet-from-payroll")
+async def fill_timesheet_from_payroll(data: List[PayrollData], month: str = "MAR 2026", year: int = 2026):
+    """
+    Convert payroll shift data into timesheets and return filled PDFs.
+
+    Accepts the payroll format with continuous work periods and converts
+    them into detailed daily shifts.
+
+    Args:
+        data: List containing payroll data with shifts and timesheets
+        month: Month string (e.g., "MAR 2026")
+        year: Year number (e.g., 2026)
+
+    Returns:
+        List of filled PDF file responses, one per employee
+    """
+    if not data or len(data) == 0:
+        raise HTTPException(status_code=400, detail="No payroll data provided")
+
+    payroll_data = data[0]  # Get first element from array
+
+    # Parse month to get month number
+    month_mapping = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+    }
+    month_parts = month.strip().upper().split()
+    month_num = month_mapping.get(month_parts[0], 3) if month_parts else 3
+
+    # Convert payroll format to timesheet format
+    try:
+        timesheets = parse_payroll_shifts(
+            payroll_data.model_dump(),
+            month=month,
+            year=year,
+            month_num=month_num
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error parsing payroll data: {str(e)}")
+
+    # Fill timesheet for each employee
+    filled_pdfs = []
+    for timesheet_dict in timesheets:
+        try:
+            # Convert dict to TimesheetData model
+            timesheet_data = TimesheetData(**timesheet_dict)
+
+            # Use existing fill logic
+            template_path = resolve_template_path(timesheet_data.month)
+
+            if not os.path.exists(template_path):
+                raise HTTPException(status_code=500, detail=f"Template PDF not found at {template_path}")
+
+            reader = PdfReader(template_path)
+            writer = PdfWriter()
+            writer.append(reader)
+
+            field_values = {}
+
+            # Always set weekday dropdowns based on requested month
+            fill_day_dropdowns(field_values, timesheet_data.month)
+
+            # Build day-to-suffix mapping based on the requested month/year
+            day_suffixes = build_day_suffixes_from_month(timesheet_data.month)
+
+            # Header fields
+            field_values["employee-name"] = timesheet_data.employee_name
+            field_values["employee-number"] = timesheet_data.employee_number
+
+            if timesheet_data.employee_payroll:
+                field_values["employee-payroll"] = timesheet_data.employee_payroll
+            if timesheet_data.leader:
+                field_values["leader"] = timesheet_data.leader
+            if timesheet_data.leader_code:
+                field_values["leader-code"] = timesheet_data.leader_code
+            if timesheet_data.month:
+                field_values["2026"] = timesheet_data.month
+            if timesheet_data.sheets:
+                field_values["Sheets"] = timesheet_data.sheets
+            if timesheet_data.comments:
+                field_values["Comments"] = timesheet_data.comments
+
+            # Process each shift
+            for shift in timesheet_data.shifts:
+                fields = get_field_names_for_day(shift.day, day_suffixes)
+
+                if shift.time_on_1:
+                    field_values[fields["time_on_1"]] = shift.time_on_1
+                if shift.time_off_1:
+                    field_values[fields["time_off_1"]] = shift.time_off_1
+                if shift.time_on_2:
+                    field_values[fields["time_on_2"]] = shift.time_on_2
+                if shift.time_off_2:
+                    field_values[fields["time_off_2"]] = shift.time_off_2
+                if shift.time_on_3:
+                    field_values[fields["time_on_3"]] = shift.time_on_3
+                if shift.time_off_3:
+                    field_values[fields["time_off_3"]] = shift.time_off_3
+                if shift.basic_hours:
+                    field_values[fields["basic_hours"]] = shift.basic_hours
+                if shift.night_duty_hours:
+                    field_values[fields["night_duty_hours"]] = shift.night_duty_hours
+                if shift.sunday_hours:
+                    field_values[fields["sunday_hours"]] = shift.sunday_hours
+                if shift.pub_hol_hours:
+                    field_values[fields["pub_hol_hours"]] = shift.pub_hol_hours
+                if shift.expenses:
+                    field_values[fields["expenses"]] = shift.expenses
+
+                field_values[fields["disturbed"]] = "/Yes" if shift.disturbed else "/Off"
+                field_values[fields["undisturbed"]] = "/Yes" if shift.undisturbed else "/Off"
+
+            # Totals
+            if timesheet_data.basic_total:
+                field_values["BASIC-TOTAL"] = timesheet_data.basic_total
+            if timesheet_data.night_duty_total:
+                field_values["NIGHT-DUTY-TOTAL"] = timesheet_data.night_duty_total
+            if timesheet_data.sun_total:
+                field_values["SUN-TOTAL"] = timesheet_data.sun_total
+            if timesheet_data.pub_hol_total:
+                field_values["PUB-HOL-TOTAL"] = timesheet_data.pub_hol_total
+            if timesheet_data.disturbed_total:
+                field_values["DIS-TOTAL"] = timesheet_data.disturbed_total
+            if timesheet_data.undisturbed_total:
+                field_values["UNDIS-TOTAL"] = timesheet_data.undisturbed_total
+            if timesheet_data.hours_used_total:
+                field_values["HOURS-USED-TOTAL"] = timesheet_data.hours_used_total
+
+            writer.update_page_form_field_values(writer.pages[0], field_values)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                writer.write(tmp)
+                filled_pdfs.append({
+                    "employee": timesheet_data.employee_name,
+                    "file_path": tmp.name
+                })
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error filling timesheet for {timesheet_dict.get('employee_name', 'unknown')}: {str(e)}")
+
+    # For now, return first employee's PDF (in production you might want to zip them)
+    if filled_pdfs:
+        return FileResponse(
+            filled_pdfs[0]["file_path"],
+            media_type="application/pdf",
+            filename=f"timesheets_{month.replace(' ', '_')}.pdf"
+        )
+
+    raise HTTPException(status_code=500, detail="No timesheets were generated")
 
 
 @app.get("/health")
